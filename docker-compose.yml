@@ -1,0 +1,62 @@
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - ./redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  integration-app-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.receiver
+    restart: unless-stopped
+    ports:
+      - "9091:9000"
+    environment:
+      - PORT=9000
+
+  integration-app-2:
+    build:
+      context: .
+      dockerfile: Dockerfile.receiver
+    restart: unless-stopped
+    ports:
+      - "9092:9000"
+    environment:
+      - PORT=9000
+
+  message-receiver:
+    build:
+      context: .
+      dockerfile: Dockerfile.receiver
+    restart: unless-stopped
+    ports:
+      - "9093:9000"
+    environment:
+      - PORT=9000
+
+  proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    depends_on:
+      redis:
+        condition: service_healthy
+      integration-app-1:
+        condition: service_started
+      integration-app-2:
+        condition: service_started
+      message-receiver:
+        condition: service_started

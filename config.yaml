@@ -1,0 +1,33 @@
+meta:
+  api_version: v25.0
+
+redis:
+  addr: redis:6379
+  password: ""
+  db: 0
+
+proxy:
+  port: 8080
+  global_rate: 100
+
+message_receiver:
+  webhook_url: http://message-receiver:9000
+
+apps:
+  - id: integration-app-1
+    name: integration-app-1
+    api_key_hash: c3aab7ac26518149a43fe07d1764e065ca4b26d94bd996c28664fa811e0d4c4a # 307856bc-45c9-40ff-92ac-26ec1a8bb693
+    webhook_url: http://integration-app-1:9000
+    rate: 0
+
+  - id: integration-app-2
+    name: integration-app-2
+    api_key_hash: 97adf90ca68596e650bb78c83cbe8ffcd92d8f7ca9162c7779252c9460bbd337 # 257f51d1-24ab-4981-ad5c-9a2a2cf22b03
+    webhook_url: http://integration-app-2:9000
+    rate: 0
+
+  - id: integration-ratelimit
+    name: integration-ratelimit
+    api_key_hash: 7e67a114db3484576bcab10f3c2a68210e4515c766c5976c4e969b2339f5ec93 # f1e2d3c4-b5a6-4789-8abc-def012345678
+    webhook_url: http://integration-app-1:9000
+    rate: 2

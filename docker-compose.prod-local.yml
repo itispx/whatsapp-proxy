@@ -1,0 +1,30 @@
+services:
+  proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+    depends_on:
+      integration-app-1:
+        condition: service_started
+      integration-app-2:
+        condition: service_started
+
+  integration-app-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.receiver
+    restart: unless-stopped
+    ports:
+      - "9091:9000"
+    environment:
+      - PORT=9000
+
+  integration-app-2:
+    build:
+      context: .
+      dockerfile: Dockerfile.receiver
+    restart: unless-stopped
+    ports:
+      - "9092:9000"
+    environment:
+      - PORT=9000

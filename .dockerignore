@@ -1,0 +1,11 @@
+.git
+*.md
+.env
+Dockerfile.dev
+Dockerfile.receiver
+docker-compose.yml
+docker-compose.prod.yml
+.air.toml
+tmp/
+redis_data/
+whatsapp-proxy
