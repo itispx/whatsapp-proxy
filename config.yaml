@@ -12,6 +12,7 @@ proxy:
 
 message_receiver:
   webhook_url: http://message-receiver:9000
+  enrichment: true
 
 apps:
   - id: integration-app-1

@@ -16,11 +16,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/itispx/whatsapp-proxy/attribution"
 	"github.com/itispx/whatsapp-proxy/config"
 	"github.com/itispx/whatsapp-proxy/handler"
 	"github.com/itispx/whatsapp-proxy/meta"
 	"github.com/itispx/whatsapp-proxy/metrics"
 	"github.com/itispx/whatsapp-proxy/ratelimit"
+	"github.com/itispx/whatsapp-proxy/registry"
 	"github.com/itispx/whatsapp-proxy/router"
 	"github.com/itispx/whatsapp-proxy/stream"
 )
@@ -62,17 +64,24 @@ func main() {
 	metaClient := meta.NewClient(cfg.Meta.AccessToken, cfg.Meta.PhoneNumberID, cfg.Meta.APIVersion, log)
 	limiter := ratelimit.New(rdb)
 	rtr := router.New(rdb, log)
+	reg := registry.New(rdb, log)
 	producer := stream.NewProducer(rdb)
 	worker := stream.NewWorker(rdb, cfg, m, log)
+	resolver := attribution.NewResolver(rtr, reg, log)
 
 	mux := http.NewServeMux()
 
-	messagesHandler := handler.NewMessages(cfg, metaClient, limiter, rtr, m, log)
+	messagesHandler := handler.NewMessages(cfg, metaClient, limiter, rtr, reg, m, log)
 	mux.Handle("POST /v1/messages",
 		handler.Auth(cfg, log, m, messagesHandler),
 	)
 
-	webhookHandler := handler.NewWebhook(cfg, rtr, producer, m, log)
+	pinHandler := handler.NewPin(cfg, limiter, reg, m, log)
+	mux.Handle("/v1/conversations/{wa_id}/pin",
+		handler.Auth(cfg, log, m, pinHandler),
+	)
+
+	webhookHandler := handler.NewWebhook(cfg, rtr, producer, m, resolver, log)
 	mux.Handle("/webhook", webhookHandler)
 
 	mux.Handle("GET /metrics", promhttp.Handler())

@@ -7,6 +7,7 @@ Meta's Cloud API allows only one webhook URL per phone number. This proxy solves
 - Accepting outbound message requests from multiple apps and forwarding them to Meta
 - Receiving all inbound webhooks from Meta and routing status callbacks to the correct app based on which app sent the original message
 - Routing inbound messages and other Meta events to a dedicated `message_receiver` webhook
+- Optionally attributing inbound replies to the app whose outbound message likely prompted them (see [Inbound attribution](#inbound-attribution))
 
 ## How it works
 
@@ -87,6 +88,7 @@ proxy:
 
 message_receiver:
   webhook_url: "https://your-service.internal/webhook"
+  enrichment: false # optional; defaults to false. See "Inbound attribution" below.
 
 apps:
   - id: "550e8400-e29b-41d4-a716-446655440000"
@@ -99,6 +101,7 @@ apps:
     name: "notifications-service"
     api_key_hash: "a665a45920..."
     webhook_url: "https://notifications.internal/whatsapp/status"
+    store_snippets: false # optional; defaults to true. See "Inbound attribution" below.
 ```
 
 ### Configuration reference
@@ -123,11 +126,13 @@ apps:
 | `proxy.port`                   | No       | `8080`        | Port the proxy listens on                                      |
 | `proxy.global_rate`            | Yes      | —             | Max requests per minute across all apps                        |
 | `message_receiver.webhook_url` | Yes      | —             | Destination for inbound messages and non-status Meta events    |
+| `message_receiver.enrichment`  | No       | `false`       | Wrap inbound messages in an attribution envelope. See "Inbound attribution" below |
 | `apps[].id`                    | Yes      | —             | Unique identifier for this app                                 |
 | `apps[].name`                  | No       | —             | Label used in log output                                       |
 | `apps[].api_key_hash`          | Yes      | —             | SHA-256 hex of the raw API key given to this app               |
 | `apps[].webhook_url`           | Yes      | —             | Where to deliver status callbacks for this app's messages      |
 | `apps[].rate`                  | No       | `global_rate` | Per-app requests per minute; `0` or omitted uses `global_rate` |
+| `apps[].store_snippets`        | No       | `true`        | Store outbound content snippets for this app. `false` keeps the topic but stores an empty snippet |
 
 ## Provisioning an API key for an app
 
@@ -301,6 +306,9 @@ docker compose logs -f proxy | jq .
 | `"dead letter"`                   | All 5 retry attempts exhausted                  |
 | `"no app mapping for message_id"` | Status callback arrived after 24 h TTL expired  |
 | `"invalid webhook signature"`     | Inbound POST to `/webhook` failed HMAC check    |
+| `"inbound attributed"`            | Attribution ladder ran for an inbound message; fields `level`, `app_id` |
+| `"conversation pinned"`           | `POST /v1/conversations/{wa_id}/pin` succeeded  |
+| `"conversation unpinned"`         | `DELETE /v1/conversations/{wa_id}/pin` succeeded |
 
 ## Prometheus integration
 
@@ -322,6 +330,7 @@ Available metrics:
 | `whatsapp_proxy_webhook_deliveries_total`      | Counter   | `app_id`, `status` | Stream worker delivery outcomes. `status`: `success`, `dead_letter`                        |
 | `whatsapp_proxy_webhook_events_total`          | Counter   | `type`             | Inbound Meta events processed. `type`: `status_update`, `inbound_message`                  |
 | `whatsapp_proxy_message_send_duration_seconds` | Histogram | `app_id`           | Latency of outbound Meta API calls                                                         |
+| `whatsapp_proxy_inbound_attribution_total`     | Counter   | `level`            | Inbound messages processed by the attribution ladder. `level`: `exact`, `pinned`, `inferred`, `ambiguous`, `unknown` |
 
 Go runtime and process metrics (memory, GC, goroutines, etc.) are also included automatically by the Prometheus client.
 
@@ -337,12 +346,22 @@ Content-Type: application/json
 
 The request body is forwarded directly to Meta's [`POST /{phone-number-id}/messages`](https://developers.facebook.com/docs/whatsapp/cloud-api/reference/messages) endpoint without modification.
 
+Optionally, apps can declare attribution metadata via headers. This never changes what's forwarded to Meta — see [Inbound attribution](#inbound-attribution).
+
+| Header                    | Type          | Default | Meaning                                                              |
+| -------------------------- | ------------- | ------- | --------------------------------------------------------------------- |
+| `X-Proxy-Expects-Reply`    | bool          | `false` | This message may elicit a user reply                                  |
+| `X-Proxy-Topic`            | string        | `""`    | Semantic label for the message, e.g. `order-1234-shipping`            |
+| `X-Proxy-Reply-TTL`        | int (seconds) | `86400` | How long this message stays a reply candidate. Capped at `172800` (48h) |
+
 **Example:**
 
 ```bash
 curl -X POST https://your-proxy/v1/messages \
   -H "Authorization: Bearer 550e8400-e29b-41d4-a716-446655440000" \
   -H "Content-Type: application/json" \
+  -H "X-Proxy-Expects-Reply: true" \
+  -H "X-Proxy-Topic: order-1234-shipping" \
   -d '{"messaging_product":"whatsapp","to":"5511999999999","type":"text","text":{"body":"Hello"}}'
 ```
 
@@ -350,9 +369,34 @@ curl -X POST https://your-proxy/v1/messages \
 
 | Status | Reason                                    |
 | ------ | ----------------------------------------- |
+| `400`  | Invalid `X-Proxy-*` header value          |
 | `401`  | Missing or invalid `Authorization` header |
 | `429`  | Rate limit exceeded (per-app or global)   |
 | `502`  | Meta API returned an error                |
+
+### Pin a conversation
+
+```
+POST   /v1/conversations/{wa_id}/pin
+DELETE /v1/conversations/{wa_id}/pin
+Authorization: Bearer <raw-api-key>
+```
+
+Pins (or unpins) a conversation to the app whose API key authenticated the request. Session pinning makes short follow-ups ("yes", "ok Friday") stick to the same app without re-classification. See [Inbound attribution](#inbound-attribution).
+
+`POST` accepts an optional JSON body: `{"ttl": 900}` (seconds; capped at `3600`, defaults to `900`). `DELETE` takes no body. Both return `204 No Content` and are rate-limited under the same per-app/global limiter as `POST /v1/messages`.
+
+**Example:**
+
+```bash
+curl -X POST https://your-proxy/v1/conversations/5511999999999/pin \
+  -H "Authorization: Bearer 550e8400-e29b-41d4-a716-446655440000" \
+  -H "Content-Type: application/json" \
+  -d '{"ttl": 1800}'
+
+curl -X DELETE https://your-proxy/v1/conversations/5511999999999/pin \
+  -H "Authorization: Bearer 550e8400-e29b-41d4-a716-446655440000"
+```
 
 ### Webhook (Meta → proxy)
 
@@ -387,7 +431,58 @@ See the [Prometheus integration](#prometheus-integration) section for the full m
 
 Mappings expire after **24 hours**. Status updates for expired mappings are logged as a warning and dropped.
 
-The proxy forwards the **raw Meta payload** without modification.
+The proxy forwards the **raw Meta payload** without modification. Status callbacks to per-app webhooks are always raw, regardless of the `enrichment` setting below.
+
+## Inbound attribution
+
+By default (`message_receiver.enrichment: false`) an inbound message is delivered to `message_receiver.webhook_url` as the raw Meta payload — unchanged from before this feature existed.
+
+When `message_receiver.enrichment: true`, the proxy also tells the receiver **which app's outbound message the user is likely replying to**. It does this with evidence, not guesses: it never silently picks a winner when the transport doesn't clearly say so — ambiguity is passed downstream explicitly.
+
+### How it decides
+
+Every outbound message the proxy forwards leaves evidence behind: who sent it, what it was about (via `X-Proxy-Topic` and a content snippet), and whether the sender expects a reply (`X-Proxy-Expects-Reply`). When an inbound message arrives, the proxy runs it through a ladder, evaluated in order — the first rung that matches wins:
+
+| Level       | Matches when                                                                        |
+| ----------- | ------------------------------------------------------------------------------------ |
+| `pinned`    | The conversation is currently pinned to an app (see [Session pinning](#session-pinning)) |
+| `exact`     | The inbound message quotes or replies to a button/list from a specific outbound message (Meta's `context.id`) |
+| `inferred`  | Exactly one recent outbound message to this user set `X-Proxy-Expects-Reply: true`   |
+| `ambiguous` | Multiple candidate outbound messages exist, but nothing above resolved a single one   |
+| `unknown`   | No candidate outbound messages exist for this user at all                            |
+
+`pinned` and `exact` both also pin the conversation to the resolved app for 15 minutes, so a follow-up reply resolves `pinned` without re-running rungs 2-4. A Redis error at any point degrades to `unknown` and logs — the inbound message is always delivered, never dropped.
+
+### The envelope
+
+```json
+{
+  "version": 1,
+  "attribution": "exact | pinned | inferred | ambiguous | unknown",
+  "resolved_app_id": "uuid-or-null",
+  "candidates": [
+    {
+      "app_id": "550e8400-e29b-41d4-a716-446655440000",
+      "message_id": "wamid.HBg...",
+      "expects_reply": true,
+      "topic": "order-1234-shipping",
+      "snippet": "Your order #1234 has shipped...",
+      "sent_at": 1752576400
+    }
+  ],
+  "payload": { "...": "raw Meta webhook payload, byte-identical" }
+}
+```
+
+`candidates` lists up to the 10 most recent outbound messages sent to this user in the last 48 hours (flagged messages first, then newest first) — it's populated for every level, including `pinned` and `exact`, so the receiver can sanity-check a resolved attribution. `payload` is always the untouched raw Meta payload.
+
+**What the receiver should do:** trust `resolved_app_id` when it's non-null. When it's `null` (`ambiguous` or `unknown`), classify against `candidates` yourself — e.g. show the user a disambiguation prompt, or fall back to a default app — and optionally call the [pin endpoint](#pin-a-conversation) once you've decided, so follow-ups stick.
+
+### Session pinning
+
+An outbound send pins its recipient's conversation to the sending app for 15 minutes (a later send from a different app overwrites the pin — newest sender wins). A resolved `exact` or `inferred` inbound match does the same. While pinned, every inbound message from that user resolves `pinned` to that app without re-evaluating rungs 2-4, and the pin's TTL slides forward on each match.
+
+The receiver can also pin or unpin directly via `POST`/`DELETE /v1/conversations/{wa_id}/pin` (see [API reference](#pin-a-conversation)) — useful right after resolving an `ambiguous` attribution itself.
 
 ## Rate limiting
 
@@ -414,12 +509,15 @@ After 5 failures the event is dead-lettered (logged, acknowledged, discarded). Y
 
 ## Redis data model
 
-| Key                 | Type       | TTL         | Purpose                           |
-| ------------------- | ---------- | ----------- | --------------------------------- |
-| `rate:global`       | Sorted set | 2 min       | Global sliding window counter     |
-| `rate:app:{app_id}` | Sorted set | 2 min       | Per-app sliding window counter    |
-| `msg:{message_id}`  | String     | 24 h        | `message_id → app_id` routing map |
-| `webhook:delivery`  | Stream     | Until ACKed | Async delivery queue              |
+| Key                    | Type       | TTL                     | Purpose                                                                 |
+| ----------------------- | ---------- | ----------------------- | ------------------------------------------------------------------------ |
+| `rate:global`           | Sorted set | 2 min                   | Global sliding window counter                                            |
+| `rate:app:{app_id}`     | Sorted set | 2 min                   | Per-app sliding window counter                                           |
+| `msg:{message_id}`      | String     | 24 h                    | `message_id → app_id` routing map                                        |
+| `msgctx:{message_id}`   | Hash       | `X-Proxy-Reply-TTL` (24h default) | Attribution context for one outbound message: `app_id`, `to`, `expects_reply`, `topic`, `snippet`, `sent_at` |
+| `convo:{wa_id}`         | Sorted set | 48 h, refreshed on write | Recent outbound `message_id`s sent to this user, scored by send time     |
+| `pin:{wa_id}`           | String     | 900 s, sliding          | `app_id` currently pinned to this user's conversation                    |
+| `webhook:delivery`      | Stream     | Until ACKed             | Async delivery queue                                                     |
 
 ## Project structure
 
@@ -428,17 +526,22 @@ whatsapp-proxy/
 ├── cmd/
 │   ├── proxy/main.go          # Entry point: wires components, starts server and worker
 │   └── receiver/main.go       # Lightweight webhook sink used by integration tests
+├── attribution/attribution.go # Inbound attribution ladder and envelope
 ├── config/config.go           # YAML loading, env var injection, key hashing
 ├── handler/
 │   ├── middleware.go          # Bearer auth middleware
 │   ├── messages.go            # POST /v1/messages
+│   ├── headers.go             # X-Proxy-* header parsing/validation
+│   ├── pin.go                 # POST+DELETE /v1/conversations/{wa_id}/pin
 │   ├── webhook.go             # GET+POST /webhook
 │   └── util.go                # JSON error helper
 ├── integration/               # Black-box integration tests (against localhost:8080)
 ├── meta/client.go             # Meta Cloud API HTTP client
 ├── metrics/metrics.go         # Prometheus metric definitions
 ├── ratelimit/ratelimit.go     # Redis sliding window rate limiter
+├── registry/registry.go       # msgctx:/convo:/pin: storage for attribution
 ├── router/router.go           # message_id → app_id storage and lookup
+├── snippet/snippet.go         # Content-context extraction from outbound bodies
 ├── stream/stream.go           # Redis Stream producer + delivery worker
 ├── config.yaml                # Non-secret configuration (safe to commit)
 ├── .env                       # Secret credentials (never committed)

@@ -26,14 +26,22 @@ type Redis struct {
 
 type MessageReceiver struct {
 	WebhookURL string `yaml:"webhook_url"`
+	Enrichment bool   `yaml:"enrichment"`
 }
 
 type App struct {
-	ID         string `yaml:"id"`
-	Name       string `yaml:"name"`
-	APIKeyHash string `yaml:"api_key_hash"`
-	WebhookURL string `yaml:"webhook_url"`
-	Rate       int    `yaml:"rate"` // per minute; 0 means use global
+	ID            string `yaml:"id"`
+	Name          string `yaml:"name"`
+	APIKeyHash    string `yaml:"api_key_hash"`
+	WebhookURL    string `yaml:"webhook_url"`
+	Rate          int    `yaml:"rate"`           // per minute; 0 means use global
+	StoreSnippets *bool  `yaml:"store_snippets"` // nil means default true
+}
+
+// SnippetsEnabled reports whether this app's outbound message content
+// should be stored as a snippet for attribution context. Defaults to true.
+func (a App) SnippetsEnabled() bool {
+	return a.StoreSnippets == nil || *a.StoreSnippets
 }
 
 type Proxy struct {

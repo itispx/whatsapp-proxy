@@ -21,6 +21,11 @@ type Metrics struct {
 
 	// MessageSendDuration observes the latency of Meta API calls.
 	MessageSendDuration *prometheus.HistogramVec
+
+	// InboundAttribution counts inbound messages processed by the attribution
+	// ladder, by resolution level.
+	// level: "exact" | "pinned" | "inferred" | "ambiguous" | "unknown"
+	InboundAttribution *prometheus.CounterVec
 }
 
 func New(reg prometheus.Registerer) *Metrics {
@@ -50,6 +55,11 @@ func New(reg prometheus.Registerer) *Metrics {
 			Help:    "Latency of outbound Meta API calls.",
 			Buckets: prometheus.DefBuckets,
 		}, []string{"app_id"}),
+
+		InboundAttribution: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "whatsapp_proxy_inbound_attribution_total",
+			Help: "Inbound messages processed by the attribution ladder, by resolution level.",
+		}, []string{"level"}),
 	}
 
 	reg.MustRegister(
@@ -58,7 +68,14 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.WebhookDeliveries,
 		m.WebhookEvents,
 		m.MessageSendDuration,
+		m.InboundAttribution,
 	)
+
+	// Pre-initialize every level so they're visible at /metrics before the
+	// first inbound message of each kind arrives.
+	for _, level := range []string{"exact", "pinned", "inferred", "ambiguous", "unknown"} {
+		m.InboundAttribution.WithLabelValues(level).Add(0)
+	}
 
 	return m
 }

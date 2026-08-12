@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -12,13 +13,22 @@ import (
 	"github.com/itispx/whatsapp-proxy/metrics"
 	"github.com/itispx/whatsapp-proxy/ratelimit"
 	"github.com/itispx/whatsapp-proxy/router"
+	"github.com/itispx/whatsapp-proxy/snippet"
 )
+
+// registryWriter is the subset of registry.Registry used to record reply
+// candidate evidence. Declared as an interface so the handler can be unit
+// tested without Redis.
+type registryWriter interface {
+	WriteContext(ctx context.Context, messageID, appID, to string, expectsReply bool, topic, snippetText string, sentAt time.Time, replyTTL time.Duration) error
+}
 
 type Messages struct {
 	cfg        *config.Config
 	metaClient *meta.Client
 	limiter    *ratelimit.Limiter
 	router     *router.Router
+	registry   registryWriter
 	metrics    *metrics.Metrics
 	log        *slog.Logger
 }
@@ -28,6 +38,7 @@ func NewMessages(
 	metaClient *meta.Client,
 	limiter *ratelimit.Limiter,
 	rtr *router.Router,
+	reg registryWriter,
 	m *metrics.Metrics,
 	log *slog.Logger,
 ) *Messages {
@@ -36,6 +47,7 @@ func NewMessages(
 		metaClient: metaClient,
 		limiter:    limiter,
 		router:     rtr,
+		registry:   reg,
 		metrics:    m,
 		log:        log,
 	}
@@ -84,6 +96,13 @@ func (h *Messages) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	sendMeta, err := ParseSendHeaders(r.Header)
+	if err != nil {
+		h.log.Debug("messages: invalid X-Proxy-* header", "app_id", app.ID, "err", err)
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	h.log.Debug("messages: reading request body", "app_id", app.ID)
 
 	body, err := io.ReadAll(r.Body)
@@ -107,11 +126,33 @@ func (h *Messages) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	h.log.Debug("messages: meta responded", "app_id", app.ID, "message_count", len(result.Messages))
 
-	// Map each message_id → app_id for routing status callbacks.
+	extracted, hasRecipient := snippet.Extract(body)
+	if !hasRecipient {
+		h.log.Debug("messages: no recipient in body, skipping registry writes", "app_id", app.ID)
+	}
+
+	snippetText := extracted.Snippet
+	if !app.SnippetsEnabled() {
+		snippetText = ""
+	}
+
+	// Map each message_id → app_id for routing status callbacks, and record
+	// reply-candidate evidence for inbound attribution.
 	for _, msg := range result.Messages {
 		h.log.Debug("messages: storing routing mapping", "app_id", app.ID, "message_id", msg.ID)
 		if err := h.router.Store(ctx, msg.ID, app.ID); err != nil {
 			h.log.Error("router store error", "app", app.ID, "message_id", msg.ID, "err", err)
+		}
+
+		if hasRecipient {
+			err := h.registry.WriteContext(
+				ctx, msg.ID, app.ID, extracted.To,
+				sendMeta.ExpectsReply, sendMeta.Topic, snippetText,
+				time.Now(), sendMeta.ReplyTTL,
+			)
+			if err != nil {
+				h.log.Error("registry write error", "app", app.ID, "message_id", msg.ID, "err", err)
+			}
 		}
 	}
 

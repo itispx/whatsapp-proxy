@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -10,45 +11,73 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/itispx/whatsapp-proxy/attribution"
 	"github.com/itispx/whatsapp-proxy/config"
 	"github.com/itispx/whatsapp-proxy/metrics"
-	"github.com/itispx/whatsapp-proxy/router"
-	"github.com/itispx/whatsapp-proxy/stream"
 )
 
-// metaPayload is used only to extract message IDs for routing.
-// The raw body is forwarded as-is to app webhooks.
+// metaPayload is used to extract message IDs for routing and, when enrichment
+// is enabled, the fields needed to attribute inbound messages. The raw body
+// is forwarded as-is to app webhooks and embedded byte-identical in the
+// enrichment envelope.
 type metaPayload struct {
 	Entry []struct {
 		Changes []struct {
-			Value struct {
-				Statuses []struct {
-					ID string `json:"id"`
-				} `json:"statuses"`
-				Messages []struct {
-					ID string `json:"id"`
-				} `json:"messages"`
-			} `json:"value"`
+			Value metaValue `json:"value"`
 		} `json:"changes"`
 	} `json:"entry"`
 }
 
+type metaValue struct {
+	Contacts []metaContact `json:"contacts"`
+	Statuses []struct {
+		ID string `json:"id"`
+	} `json:"statuses"`
+	Messages []metaMessage `json:"messages"`
+}
+
+type metaContact struct {
+	WaID string `json:"wa_id"`
+}
+
+type metaMessage struct {
+	ID      string `json:"id"`
+	From    string `json:"from"`
+	Context struct {
+		ID string `json:"id"`
+	} `json:"context"`
+}
+
+// statusRouter is the subset of router.Router used to route status callbacks.
+// Declared as an interface so the handler can be unit tested without Redis.
+type statusRouter interface {
+	Lookup(ctx context.Context, messageID string) (string, bool, error)
+}
+
+// enqueuer is the subset of stream.Producer used to hand off deliveries.
+// Declared as an interface so the handler can be unit tested without Redis.
+type enqueuer interface {
+	Enqueue(ctx context.Context, appID string, payload []byte) error
+}
+
 type Webhook struct {
 	cfg      *config.Config
-	router   *router.Router
-	producer *stream.Producer
+	router   statusRouter
+	producer enqueuer
 	metrics  *metrics.Metrics
+	resolver *attribution.Resolver
 	log      *slog.Logger
 }
 
 func NewWebhook(
 	cfg *config.Config,
-	rtr *router.Router,
-	producer *stream.Producer,
+	rtr statusRouter,
+	producer enqueuer,
 	m *metrics.Metrics,
+	resolver *attribution.Resolver,
 	log *slog.Logger,
 ) *Webhook {
-	return &Webhook{cfg: cfg, router: rtr, producer: producer, metrics: m, log: log}
+	return &Webhook{cfg: cfg, router: rtr, producer: producer, metrics: m, resolver: resolver, log: log}
 }
 
 // ServeHTTP handles both GET (hub.challenge) and POST (events) from Meta.
@@ -156,7 +185,20 @@ func (h *Webhook) handleEvent(w http.ResponseWriter, r *http.Request) {
 			}
 
 			// Inbound messages and any other events → message_receiver webhook.
-			if len(val.Messages) > 0 || (len(val.Statuses) == 0 && len(val.Messages) == 0) {
+			if len(val.Messages) > 0 {
+				payload := body
+				if h.cfg.MessageReceiver.Enrichment {
+					payload = h.buildEnrichedPayload(ctx, val, body)
+				}
+				h.log.Debug("webhook: enqueuing to message_receiver")
+				if err := h.producer.Enqueue(ctx, "message_receiver", payload); err != nil {
+					h.log.Error("enqueue message_receiver error", "err", err)
+				} else {
+					h.metrics.WebhookEvents.WithLabelValues("inbound_message").Inc()
+					h.log.Debug("webhook: message_receiver enqueued")
+				}
+			} else if len(val.Statuses) == 0 {
+				// Any other Meta event: keep today's raw format regardless of enrichment.
 				h.log.Debug("webhook: enqueuing to message_receiver")
 				if err := h.producer.Enqueue(ctx, "message_receiver", body); err != nil {
 					h.log.Error("enqueue message_receiver error", "err", err)
@@ -167,6 +209,30 @@ func (h *Webhook) handleEvent(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+}
+
+// buildEnrichedPayload runs the attribution ladder for the first inbound
+// message in val and wraps the raw body in an enrichment envelope. On any
+// failure it degrades to the raw body rather than dropping the message.
+func (h *Webhook) buildEnrichedPayload(ctx context.Context, val metaValue, body []byte) []byte {
+	msg := val.Messages[0]
+
+	waID := msg.From
+	if len(val.Contacts) > 0 && val.Contacts[0].WaID != "" {
+		waID = val.Contacts[0].WaID
+	}
+
+	res := h.resolver.Resolve(ctx, waID, msg.Context.ID)
+	h.metrics.InboundAttribution.WithLabelValues(res.Level).Inc()
+	h.log.Info("inbound attributed", "level", res.Level, "app_id", res.ResolvedAppID, "wa_id", waID)
+
+	env := attribution.BuildEnvelope(res, json.RawMessage(body))
+	out, err := json.Marshal(env)
+	if err != nil {
+		h.log.Error("failed to marshal enrichment envelope", "err", err)
+		return body
+	}
+	return out
 }
 
 func (h *Webhook) verifySignature(r *http.Request, body []byte) bool {

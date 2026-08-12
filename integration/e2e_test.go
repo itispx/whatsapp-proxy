@@ -23,8 +23,8 @@ const (
 	app2Key     = "257f51d1-24ab-4981-ad5c-9a2a2cf22b03"
 	app2Receive = "http://localhost:9092"
 
-	rateLimitKey        = "f1e2d3c4-b5a6-4789-8abc-def012345678"
-	messageReceiverURL  = "http://localhost:9093"
+	rateLimitKey       = "f1e2d3c4-b5a6-4789-8abc-def012345678"
+	messageReceiverURL = "http://localhost:9093"
 )
 
 func TestSendMessage_ReceivesSentStatus(t *testing.T) {
